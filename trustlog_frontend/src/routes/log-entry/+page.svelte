@@ -1,6 +1,7 @@
 <script lang="ts">
     import { quintOut } from 'svelte/easing';
     import { slide } from 'svelte/transition';
+    import { goto } from '$app/navigation'; // Import for navigation
 
     // Form fields, initialized to empty or default values
     let dateOfIncident: string = '';
@@ -34,9 +35,14 @@
     // Reactive declaration: determines if supporting evidence snippet should be shown
     $: showSupportingEvidence = category === 'Unilateral Decision-Making';
 
+    // Store the base URL for your Flask backend
+    // IMPORTANT: During development, this will typically be localhost:5000.
+    // When deploying to your Raspberry Pi, you will change 'localhost' to your Raspberry Pi's IP address.
+    const FLASK_API_BASE_URL = 'http://localhost:5000'; // Or your Raspberry Pi's IP, e.g., 'http://192.168.1.100:5000'
+
     // Function to handle form submission
     async function saveLogRecord() {
-        // Basic client-side validation (more robust server-side validation is crucial) [cite: 30, 32]
+        // Basic client-side validation (more robust server-side validation is crucial)
         if (!dateOfIncident || !category || !descriptionOfIncident || impactTypes.length === 0) {
             alert('Please fill in all required fields (Date, Category, Description, Impact Types).');
             return;
@@ -46,21 +52,41 @@
             date_of_incident: dateOfIncident,
             category: category,
             description_of_incident: descriptionOfIncident,
-            impact_types: impactTypes, // Will be stringified to JSON on backend
+            impact_types: impactTypes, // Svelte sends this as a JavaScript array
             impact_details: impactDetails,
+            // Only include supporting_evidence_snippet if the category is 'Unilateral Decision-Making'
             supporting_evidence_snippet: showSupportingEvidence ? supportingEvidenceSnippet : null,
             exhibit_reference: exhibitReference
             // time_of_incident and created_at will be handled by the backend
         };
 
-        console.log('Log Data to send:', logData);
+        console.log('Sending Log Data:', logData);
 
-        // Here you would typically send this data to your Flask backend.
-        // For now, we'll just log it.
-        alert('Log Record Saved (simulated)! Check console for data.');
+        try {
+            const response = await fetch(`${FLASK_API_BASE_URL}/api/log_records`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(logData) // Convert JavaScript object to JSON string
+            });
 
-        // Clear form after simulated submission
-        clearForm();
+            if (response.ok) {
+                const result = await response.json();
+                console.log('Log record created successfully:', result);
+                alert('Log Record Saved Successfully!');
+                clearForm();
+                // Optionally navigate to a success page or reports page
+                goto('/reports');
+            } else {
+                const errorData = await response.json();
+                console.error('Error creating log record:', errorData);
+                alert(`Failed to save log record: ${errorData.error || response.statusText}`);
+            }
+        } catch (error) {
+            console.error('Network or unexpected error:', error);
+            alert('An unexpected error occurred while trying to save the log record.');
+        }
     }
 
     // Function to clear the form
@@ -217,7 +243,7 @@
     }
 
     .log-form label {
-        display: block; /* Labels above input fields [cite: 27] */
+        display: block; /* Labels above input fields */
         margin-bottom: 0.5rem;
         font-weight: bold;
         color: #555;
@@ -227,8 +253,8 @@
     .log-form input[type="date"],
     .log-form textarea,
     .log-form select {
-        width: 100%; /* Single-column format [cite: 26] */
-        padding: 0.8rem; /* Increased field sizes for easier tapping on mobile [cite: 27] */
+        width: 100%; /* Single-column format */
+        padding: 0.8rem; /* Increased field sizes for easier tapping on mobile */
         border: 1px solid #ccc;
         border-radius: 4px;
         box-sizing: border-box; /* Include padding in width */
@@ -288,7 +314,7 @@
     }
 
     .save-button {
-        background-color: #28a745; /* Prominent save button [cite: 26] */
+        background-color: #28a745; /* Prominent save button */
         color: white;
     }
 

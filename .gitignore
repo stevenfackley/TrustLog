@@ -60,3 +60,7 @@ Thumbs.db
 # Other common temporary files
 *.swp
 *.swo
+
+*.db
+*.db-shm
+*.db-wal
