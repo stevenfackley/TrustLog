@@ -1,0 +1,62 @@
+# Gitignore for TrustLog Project (Flask Backend & SvelteKit Frontend)
+
+# ====================
+# Python (Flask Backend)
+# ====================
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Byte-code files
+*.pyc
+__pycache__/
+
+# Database files
+*.db # This will ignore your tracking_log.db file.
+# If you ever want to commit the initial empty database schema (but not data),
+# you'd need to explicitly git add -f tracking_log.db and then ensure it's empty.
+# For now, ignoring it is safer as it contains user data.
+
+# Uploaded files
+uploads/ # This will ignore the directory where user attachments are stored.
+# NEVER commit user-uploaded files or sensitive data!
+
+# Python application logs
+*.log
+
+# Editor backup files
+*~
+*.bak
+.ipynb_checkpoints/ # Jupyter notebooks checkpoints if you use them for testing
+
+# ====================
+# Node.js (SvelteKit Frontend)
+# ====================
+# Node modules
+node_modules/
+
+# Build output
+.svelte-kit/
+build/
+.next/ # In case you accidentally use Next.js, though unlikely here
+
+# npm debug logs
+npm-debug.log*
+.npm/
+
+# env files
+.env
+.env.*.local
+
+# IDE-specific files (e.g., VS Code)
+.vscode/
+.idea/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Other common temporary files
+*.swp
+*.swo
