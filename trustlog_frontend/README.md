@@ -22,7 +22,12 @@ Once you've created a project and installed dependencies with `npm install` (or 
 npm run dev
 
 # or start the server and open the app in a new browser tab
+#    "dev:all": "concurrently \"npm run dev\" \"cd ../trustlog_backend && python -m flask --app app run --host=0.0.0.0\""
+# will run the backend and frontend in parallel
 npm run dev -- --open
+
+Use
+npm run dev:all
 ```
 
 ## Building
