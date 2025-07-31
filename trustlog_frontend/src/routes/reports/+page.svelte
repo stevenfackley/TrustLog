@@ -2,6 +2,8 @@
     import { onMount, onDestroy } from 'svelte';
     import { goto } from '$app/navigation';
     import { slide } from 'svelte/transition';
+    import { browser } from '$app/environment';
+    import { authenticatedFetch } from '$lib/utils/api';
     import {
         Chart,
         Title,
@@ -10,7 +12,7 @@
         BarElement,
         CategoryScale,
         LinearScale,
-        BarController
+        BarController,
     } from 'chart.js';
 
     Chart.register(
@@ -40,8 +42,8 @@
     interface Attachment {
         id: number;
         log_record_id: number;
-        filename: string; // Original filename
-        stored_filename: string; // Unique filename on server
+        filename: string;
+        stored_filename: string;
         filepath: string;
         filetype: string;
         filesize_bytes: number;
@@ -77,14 +79,13 @@
         'Alcohol Use'
     ];
 
-    // Store the base URL for your Flask backend
-    const FLASK_API_BASE_URL = 'http://localhost:5000';
+    const FLASK_API_BASE_URL = 'http://localhost:5000'; // Still used for download links directly
 
     let chartCanvas: HTMLCanvasElement;
     let myChart: Chart | null = null;
 
     function createOrUpdateChart() {
-        if (!chartCanvas || activeTab !== 'charts') return;
+        if (!browser || !chartCanvas || activeTab !== 'charts') return;
 
         if (myChart) {
             myChart.destroy();
@@ -149,18 +150,20 @@
     }
 
     onMount(async () => {
-        await fetchLogRecords();
+        if (browser) {
+            await fetchLogRecords();
+        }
     });
 
-    $: if (activeTab === 'charts' && !loading && !error) {
-        if (logRecords.length > 0) {
-            setTimeout(() => {
+    $: if (activeTab === 'charts' && !loading && !error && browser) {
+        setTimeout(() => {
+            if (logRecords.length > 0) {
                 createOrUpdateChart();
-            }, 0);
-        } else if (myChart) {
-            myChart.destroy();
-            myChart = null;
-        }
+            } else if (myChart) {
+                myChart.destroy();
+                myChart = null;
+            }
+        }, 0);
     }
 
     onDestroy(() => {
@@ -187,10 +190,10 @@
         params.append('sort_order', sortOrder);
 
         const queryString = params.toString();
-        const url = `${FLASK_API_BASE_URL}/api/log_records${queryString ? `?${queryString}` : ''}`;
+        const url = `/api/log_records${queryString ? `?${queryString}` : ''}`;
 
         try {
-            const response = await fetch(url);
+            const response = await authenticatedFetch(url);
 
             if (response.ok) {
                 logRecords = await response.json();
@@ -201,11 +204,14 @@
                 console.error('Error fetching log records:', errorData);
             }
         } catch (e: any) {
-            error = `Network error: ${e.message}`;
+            if (e.message === 'Unauthorized') {
+                error = 'Please log in to view reports.';
+            } else {
+                error = `Network error: ${e.message}`;
+            }
             console.error('Network or unexpected error:', e);
         } finally {
             loading = false;
-            // After fetching new records, ensure no attachment list is incorrectly open
             if (expandedLogId && !logRecords.some(r => r.id === expandedLogId)) {
                 expandedLogId = null;
                 attachmentsForExpandedLog = [];
@@ -223,7 +229,7 @@
             fetchingAttachments = true;
             attachmentsError = null;
             try {
-                const response = await fetch(`${FLASK_API_BASE_URL}/api/log_records/${logId}/attachments`);
+                const response = await authenticatedFetch(`/api/log_records/${logId}/attachments`);
                 if (response.ok) {
                     attachmentsForExpandedLog = await response.json();
                 } else {
@@ -232,7 +238,11 @@
                     console.error('Error fetching attachments:', errorData);
                 }
             } catch (e: any) {
-                attachmentsError = `Network error fetching attachments: ${e.message}`;
+                if (e.message !== 'Unauthorized') {
+                    attachmentsError = `Network error fetching attachments: ${e.message}`;
+                } else {
+                    attachmentsError = 'Please log in to view attachments.';
+                }
                 console.error('Network error fetching attachments:', e);
             } finally {
                 fetchingAttachments = false;
@@ -244,19 +254,19 @@
         return `${FLASK_API_BASE_URL}/api/attachments/${storedFilename}`;
     }
 
-    // NEW: Function to navigate to edit page
     function editLogRecord(logId: number) {
-        goto(`/log-entry?id=${logId}`);
+        if (browser) {
+            goto(`/log-entry?id=${logId}`);
+        }
     }
 
-    // NEW: Function to delete log record
     async function deleteLogRecord(logId: number) {
         if (!confirm('Are you sure you want to delete this log record and all its attachments? This action cannot be undone.')) {
-            return; // User cancelled
+            return;
         }
 
         try {
-            const response = await fetch(`${FLASK_API_BASE_URL}/api/log_records/${logId}`, {
+            const response = await authenticatedFetch(`/api/log_records/${logId}`, {
                 method: 'DELETE',
             });
 
@@ -264,15 +274,17 @@
                 const result = await response.json();
                 console.log('Log record deleted successfully:', result);
                 alert('Log Record Deleted Successfully!');
-                await fetchLogRecords(); // Refresh the list
+                await fetchLogRecords();
             } else {
                 const errorData = await response.json();
                 console.error('Error deleting log record:', errorData);
                 alert(`Failed to delete log record: ${errorData.error || response.statusText}`);
             }
         } catch (error) {
-            console.error('Network or unexpected error during deletion:', error);
-            alert('An unexpected error occurred while trying to delete the log record.');
+            if (error.message !== 'Unauthorized') {
+                console.error('Network or unexpected error during deletion:', error);
+                alert('An unexpected error occurred while trying to delete the log record.');
+            }
         }
     }
 
@@ -722,12 +734,14 @@
     }
 
     .simple-bar-chart {
+        /* These styles are unused and will be removed */
         list-style: none;
         padding: 0;
         margin: 1.5rem 0;
     }
 
     .simple-bar-chart li {
+        /* These styles are unused and will be removed */
         background-color: #a0cffc;
         color: #333;
         padding: 0.5rem;
@@ -743,6 +757,7 @@
     }
 
     .chart-placeholder {
+        /* These styles are unused and will be removed */
         background-color: #f0f8ff;
         border: 1px dashed #cceeff;
         padding: 1.5rem;
@@ -764,6 +779,7 @@
     }
 
     .charts-view .chart-placeholder {
+        /* This rule hides the old placeholder div */
         display: none;
     }
 
@@ -838,7 +854,7 @@
     /* New styles for edit/delete buttons */
     .log-card-actions {
         display: flex;
-        justify-content: flex-end; /* Align buttons to the right */
+        justify-content: flex-end;
         gap: 0.5rem;
         margin-top: 1rem;
         padding-top: 0.8rem;
@@ -854,7 +870,7 @@
     }
 
     .edit-button {
-        background-color: #17a2b8; /* Info blue */
+        background-color: #17a2b8;
         color: white;
         border: none;
     }
@@ -864,7 +880,7 @@
     }
 
     .delete-button {
-        background-color: #dc3545; /* Danger red */
+        background-color: #dc3545;
         color: white;
         border: none;
     }

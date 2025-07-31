@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, session
 import sqlite3
 import os
 from datetime import datetime
@@ -7,12 +7,19 @@ import json
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import uuid
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 
 app = Flask(__name__)
 DATABASE = 'tracking_log.db'
 UPLOAD_FOLDER = 'uploads'
 
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 # 16 Megabytes
+# Secret key for session management (CRITICAL for Flask-Login and session security)
+# In production, this should be a strong, randomly generated string,
+# loaded from an environment variable or config file, NOT hardcoded.
+app.config['SECRET_KEY'] = 'your_super_secret_key_change_this_in_production'
+
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 # 16 Megabytes (adjust as needed)
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'txt'}
 
@@ -22,15 +29,51 @@ if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
     print(f"Created upload folder: {UPLOAD_FOLDER}")
 
-CORS(app)
+CORS(app, supports_credentials=True) # IMPORTANT: Enable supports_credentials for sessions/cookies
 
-def allowed_file(filename):
-    """Checks if the file extension is allowed."""
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+# --- Flask-Login Setup ---
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login' # Define the view Flask-Login should redirect to for login
 
+# User class for Flask-Login
+class User(UserMixin):
+    def __init__(self, id, username, password_hash):
+        self.id = id
+        self.username = username
+        self.password_hash = password_hash
+
+    def get_id(self):
+        return str(self.id)
+
+    @staticmethod
+    def get(user_id):
+        conn = get_db_connection()
+        user_data = conn.execute("SELECT id, username, password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        conn.close()
+        if user_data:
+            return User(user_data['id'], user_data['username'], user_data['password_hash'])
+        return None
+
+    @staticmethod
+    def get_by_username(username):
+        conn = get_db_connection()
+        user_data = conn.execute("SELECT id, username, password_hash FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        if user_data:
+            return User(user_data['id'], user_data['username'], user_data['password_hash'])
+        return None
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.get(user_id)
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    return jsonify({"error": "Unauthorized: Please log in to access this resource"}), 401
+
+# --- Database Connection and Initialization ---
 def get_db_connection():
-    """Establishes a connection to the SQLite database."""
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL;')
@@ -38,9 +81,9 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Initializes the database by creating tables if they don't exist."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        # Create log_records table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS log_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,13 +91,14 @@ def init_db():
                 time_of_incident TEXT,
                 category TEXT NOT NULL,
                 description_of_incident TEXT NOT NULL,
-                impact_types TEXT NOT NULL, -- Storing as JSON array for multi-select
+                impact_types TEXT NOT NULL,
                 impact_details TEXT,
                 supporting_evidence_snippet TEXT,
                 exhibit_reference TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Create attachments table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS attachments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,49 +112,147 @@ def init_db():
                 FOREIGN KEY (log_record_id) REFERENCES log_records(id)
             )
         ''')
+        # Create users table for authentication
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            )
+        ''')
+        # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_date ON log_records (date_of_incident);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_category ON log_records (category);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_attachment_log_id ON attachments (log_record_id);')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_user_username ON users (username);')
         conn.commit()
     print("Database initialized or already exists.")
 
 with app.app_context():
     init_db()
 
+# Helper function for file extension validation (Moved to ensure global accessibility)
+def allowed_file(filename):
+    """Checks if the file extension is allowed."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# --- API Routes ---
 @app.route('/')
 def home():
-    """Basic home route to confirm the backend is running."""
-    return "Welcome to the TrustLog Backend! API is available at /api/log_records"
+    return "Welcome to the TrustLog Backend!"
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """Returns application status and user authentication status."""
+    return jsonify({
+        "message": "TrustLog Backend is running.",
+        "authenticated": current_user.is_authenticated,
+        "username": current_user.username if current_user.is_authenticated else None
+    })
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    """Endpoint for user registration."""
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    conn = get_db_connection()
+    existing_user = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing_user:
+        conn.close()
+        return jsonify({"error": "Username already exists"}), 409
+
+    hashed_password = generate_password_hash(password)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed_password))
+        conn.commit()
+        new_user_id = cursor.lastrowid
+        user = User.get(new_user_id)
+        login_user(user)
+        return jsonify({"message": "User registered and logged in successfully", "username": user.username}), 201
+    except sqlite3.Error as e:
+        print(f"Database error during registration: {e}")
+        return jsonify({"error": "Could not register user", "details": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    """Endpoint for user login."""
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    user = User.get_by_username(username)
+    if user and check_password_hash(user.password_hash, password):
+        login_user(user)
+        return jsonify({"message": "Logged in successfully", "username": user.username}), 200
+    return jsonify({"error": "Invalid username or password"}), 401
+
+@app.route('/api/logout', methods=['POST'])
+@login_required
+def logout():
+    """Endpoint for user logout."""
+    logout_user()
+    return jsonify({"message": "Logged out successfully"}), 200
+
+# --- Protected API Routes ---
+# Modified create_log_record to handle combined form data and files
 
 @app.route('/api/log_records', methods=['POST'])
+@login_required
 def create_log_record():
-    """API endpoint to create a new log record."""
-    if not request.is_json:
-        return jsonify({"error": "Request must be JSON"}), 400
-
-    data = request.get_json()
-
-    required_fields = ['date_of_incident', 'category', 'description_of_incident', 'impact_types']
-    for field in required_fields:
-        if field not in data or not data[field]:
-            return jsonify({"error": f"Missing or empty required field: {field}"}), 400
-
-    impact_types = data.get('impact_types')
-    if not isinstance(impact_types, list):
-        return jsonify({"error": "impact_types must be a list"}), 400
-    impact_types_json = json.dumps(impact_types)
-
-    date_of_incident = data.get('date_of_incident')
-    time_of_incident = data.get('time_of_incident', None)
-    category = data.get('category')
-    description_of_incident = data.get('description_of_incident')
-    impact_details = data.get('impact_details', None)
-    supporting_evidence_snippet = data.get('supporting_evidence_snippet', None)
-    exhibit_reference = data.get('exhibit_reference', None)
+    """
+    API endpoint to create a new log record and handle attachments atomically.
+    Expects FormData with text fields and file parts.
+    """
+    conn = None
+    temp_saved_files = [] # Keep track of files saved to disk for cleanup on rollback
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        conn.execute('BEGIN TRANSACTION;') # Start a transaction
+
+        # Parse form data
+        data = request.form
+        files = request.files.getlist('files') # Get list of all files with 'files' field name
+
+        # Server-side validation for mandatory text fields
+        required_fields = ['date_of_incident', 'category', 'description_of_incident', 'impact_types']
+        for field in required_fields:
+            if field not in data or not data[field]:
+                raise ValueError(f"Missing or empty required field: {field}")
+
+        # Parse impact_types from JSON string (sent by FormData)
+        impact_types_json_str = data.get('impact_types')
+        try:
+            impact_types = json.loads(impact_types_json_str) if impact_types_json_str else []
+            if not isinstance(impact_types, list):
+                raise ValueError("impact_types must be a valid JSON array")
+        except json.JSONDecodeError:
+            raise ValueError("impact_types must be a valid JSON array string")
+
+        date_of_incident = data.get('date_of_incident')
+        time_of_incident = data.get('time_of_incident', None)
+        category = data.get('category')
+        description_of_incident = data.get('description_of_incident')
+        impact_details = data.get('impact_details', None)
+        supporting_evidence_snippet = data.get('supporting_evidence_snippet', None)
+        if supporting_evidence_snippet == 'null':
+            supporting_evidence_snippet = None
+        exhibit_reference = data.get('exhibit_reference', None)
+
+        # Insert log record
         cursor.execute(
             """
             INSERT INTO log_records (
@@ -120,72 +262,115 @@ def create_log_record():
             """,
             (
                 date_of_incident, time_of_incident, category, description_of_incident,
-                impact_types_json, impact_details, supporting_evidence_snippet, exhibit_reference
+                json.dumps(impact_types), impact_details, supporting_evidence_snippet, exhibit_reference
             )
         )
-        conn.commit()
         log_id = cursor.lastrowid
-        conn.close()
-        return jsonify({"message": "Log record created successfully", "id": log_id}), 201
-    except sqlite3.Error as e:
-        print(f"Database error during log record creation: {e}")
-        return jsonify({"error": "Could not create log record", "details": str(e)}), 500
+
+        # Handle file uploads if any
+        for file in files:
+            if file.filename == '':
+                continue
+
+            if not allowed_file(file.filename): # Use allowed_file helper
+                raise ValueError(f"File type not allowed for: {file.filename}")
+
+            original_filename = file.filename
+            secured_filename = secure_filename(original_filename)
+            file_extension = secured_filename.rsplit('.', 1)[1].lower()
+            unique_filename = f"{uuid.uuid4()}.{file_extension}"
+
+            today_path = datetime.now().strftime("%Y/%m")
+            destination_dir = os.path.join(UPLOAD_FOLDER, today_path)
+            if not os.path.exists(destination_dir):
+                os.makedirs(destination_dir)
+
+            full_filepath_on_disk = os.path.join(destination_dir, unique_filename)
+            
+            file.save(full_filepath_on_disk) # Save physical file
+            temp_saved_files.append(full_filepath_on_disk) # Add to cleanup list
+
+            filesize_bytes = os.path.getsize(full_filepath_on_disk)
+
+            # Insert attachment metadata
+            cursor.execute(
+                """
+                INSERT INTO attachments (
+                    log_record_id, filename, stored_filename, filepath, filetype, filesize_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    log_id, original_filename, unique_filename,
+                    os.path.join(today_path, unique_filename), # Store relative path
+                    file.content_type, filesize_bytes
+                )
+            )
+
+        conn.commit() # Commit transaction if everything successful
+        return jsonify({"message": "Log record and attachments created successfully", "id": log_id}), 201
+
+    except (ValueError, sqlite3.Error) as e:
+        if conn: conn.execute('ROLLBACK;') # Rollback DB transaction on error
+        for fpath in temp_saved_files: # Clean up physical files
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        print(f"Error during combined record/attachment creation: {e}")
+        return jsonify({"error": str(e)}), 400 if isinstance(e, ValueError) else 500
     except Exception as e:
-        print(f"An unexpected error occurred during log record creation: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        if conn: conn.execute('ROLLBACK;') # Rollback DB transaction on error
+        for fpath in temp_saved_files: # Clean up physical files
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        print(f"An unexpected error occurred during combined record/attachment creation: {e}")
+        return jsonify({"error": "An unexpected server error occurred during record creation", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
 
 @app.route('/api/log_records', methods=['GET'])
+@login_required
 def get_log_records():
-    """
-    API endpoint to retrieve log records with optional filtering and sorting.
-    Query parameters:
-    - category: Filter by incident category.
-    - start_date: Filter by date_of_incident >= start_date (YYYY-MM-DD).
-    - end_date: Filter by date_of_incident <= end_date (YYYY-MM-DD).
-    - sort_by: Column to sort by (e.g., 'date_of_incident', 'category').
-    - sort_order: 'asc' or 'desc'.
-    """
-    category_filter = request.args.get('category')
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-    sort_by = request.args.get('sort_by', 'date_of_incident')
-    sort_order = request.args.get('sort_order', 'desc').upper()
-
-    valid_sort_columns = ['date_of_incident', 'category', 'created_at']
-    if sort_by not in valid_sort_columns:
-        return jsonify({"error": f"Invalid sort_by column: {sort_by}"}), 400
-
-    if sort_order not in ['ASC', 'DESC']:
-        return jsonify({"error": f"Invalid sort_order: {sort_order}"}), 400
-
-    query = """
-        SELECT lr.*, COUNT(a.id) AS attachment_count
-        FROM log_records lr
-        LEFT JOIN attachments a ON lr.id = a.log_record_id
-        WHERE 1=1
-    """
-    params = []
-
-    if category_filter:
-        query += " AND lr.category = ?"
-        params.append(category_filter)
-
-    if start_date:
-        query += " AND lr.date_of_incident >= ?"
-        params.append(start_date)
-
-    if end_date:
-        query += " AND lr.date_of_incident <= ?"
-        params.append(end_date)
-
-    query += f" GROUP BY lr.id ORDER BY lr.{sort_by} {sort_order}, lr.created_at DESC"
-
+    conn = None
     try:
         conn = get_db_connection()
+        category_filter = request.args.get('category')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        sort_by = request.args.get('sort_by', 'date_of_incident')
+        sort_order = request.args.get('sort_order', 'desc').upper()
+
+        valid_sort_columns = ['date_of_incident', 'category', 'created_at']
+        if sort_by not in valid_sort_columns:
+            return jsonify({"error": f"Invalid sort_by column: {sort_by}"}), 400
+
+        if sort_order not in ['ASC', 'DESC']:
+            return jsonify({"error": f"Invalid sort_order: {sort_order}"}), 400
+
+        query = """
+            SELECT lr.*, COUNT(a.id) AS attachment_count
+            FROM log_records lr
+            LEFT JOIN attachments a ON lr.id = a.log_record_id
+            WHERE 1=1
+        """
+        params = []
+
+        if category_filter:
+            query += " AND lr.category = ?"
+            params.append(category_filter)
+
+        if start_date:
+            query += " AND lr.date_of_incident >= ?"
+            params.append(start_date)
+
+        if end_date:
+            query += " AND lr.date_of_incident <= ?"
+            params.append(end_date)
+
+        query += f" GROUP BY lr.id ORDER BY lr.{sort_by} {sort_order}, lr.created_at DESC"
+
         cursor = conn.cursor()
         cursor.execute(query, params)
         log_records = cursor.fetchall()
-        conn.close()
 
         records_list = []
         for record in log_records:
@@ -197,22 +382,21 @@ def get_log_records():
             records_list.append(record_dict)
 
         return jsonify(records_list), 200
-    except sqlite3.Error as e:
-        print(f"Database error during log record retrieval: {e}")
-        return jsonify({"error": "Could not retrieve log records", "details": str(e)}), 500
     except Exception as e:
         print(f"An unexpected error occurred during log record retrieval: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        return jsonify({"error": "An unexpected server error occurred during record retrieval", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
 
 @app.route('/api/log_records/<int:log_id>', methods=['GET'])
+@login_required
 def get_log_record_by_id(log_id):
-    """API endpoint to retrieve a single log record by its ID."""
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM log_records WHERE id = ?", (log_id,))
         record = cursor.fetchone()
-        conn.close()
 
         if record is None:
             return jsonify({"error": "Log record not found"}), 404
@@ -224,47 +408,64 @@ def get_log_record_by_id(log_id):
             record_dict['impact_types'] = []
 
         return jsonify(record_dict), 200
-    except sqlite3.Error as e:
-        print(f"Database error during single log record retrieval: {e}")
-        return jsonify({"error": "Could not retrieve log record", "details": str(e)}), 500
     except Exception as e:
         print(f"An unexpected error occurred during single log record retrieval: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        return jsonify({"error": "An unexpected server error occurred during record retrieval", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
 
 @app.route('/api/log_records/<int:log_id>', methods=['PUT'])
+@login_required
 def update_log_record(log_id):
-    """API endpoint to update an existing log record."""
-    if not request.is_json:
-        return jsonify({"error": "Request must be JSON"}), 400
-
-    data = request.get_json()
-
-    required_fields = ['date_of_incident', 'category', 'description_of_incident', 'impact_types']
-    for field in required_fields:
-        if field not in data or not data[field]:
-            return jsonify({"error": f"Missing or empty required field: {field}"}), 400
-
-    impact_types = data.get('impact_types')
-    if not isinstance(impact_types, list):
-        return jsonify({"error": "impact_types must be a list"}), 400
-    impact_types_json = json.dumps(impact_types)
-
-    date_of_incident = data.get('date_of_incident')
-    time_of_incident = data.get('time_of_incident', None)
-    category = data.get('category')
-    description_of_incident = data.get('description_of_incident')
-    impact_details = data.get('impact_details', None)
-    supporting_evidence_snippet = data.get('supporting_evidence_snippet', None)
-    exhibit_reference = data.get('exhibit_reference', None)
+    """
+    API endpoint to update an existing log record.
+    Expects FormData with text fields and new file parts.
+    Existing attachments are managed via separate DELETE attachment endpoint.
+    """
+    conn = None
+    temp_saved_files = [] # For cleanup on rollback
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        conn.execute('BEGIN TRANSACTION;') # Start a transaction
+
+        # Check if log record exists
         cursor.execute("SELECT id FROM log_records WHERE id = ?", (log_id,))
         if cursor.fetchone() is None:
-            conn.close()
+            conn.execute('ROLLBACK;')
             return jsonify({"error": "Log record not found"}), 404
 
+        # Parse form data
+        data = request.form
+        new_files = request.files.getlist('files')
+
+        # Server-side validation for mandatory text fields
+        required_fields = ['date_of_incident', 'category', 'description_of_incident', 'impact_types']
+        for field in required_fields:
+            if field not in data or not data[field]:
+                raise ValueError(f"Missing or empty required field: {field}")
+
+        # Parse impact_types from JSON string
+        impact_types_json_str = data.get('impact_types')
+        try:
+            impact_types = json.loads(impact_types_json_str) if impact_types_json_str else []
+            if not isinstance(impact_types, list):
+                raise ValueError("impact_types must be a valid JSON array")
+        except json.JSONDecodeError:
+            raise ValueError("impact_types must be a valid JSON array string")
+
+        date_of_incident = data.get('date_of_incident')
+        time_of_incident = data.get('time_of_incident', None)
+        category = data.get('category')
+        description_of_incident = data.get('description_of_incident')
+        impact_details = data.get('impact_details', None)
+        supporting_evidence_snippet = data.get('supporting_evidence_snippet', None)
+        if supporting_evidence_snippet == 'null':
+            supporting_evidence_snippet = None
+        exhibit_reference = data.get('exhibit_reference', None)
+
+        # Update log record
         cursor.execute(
             """
             UPDATE log_records SET
@@ -280,129 +481,36 @@ def update_log_record(log_id):
             """,
             (
                 date_of_incident, time_of_incident, category, description_of_incident,
-                impact_types_json, impact_details, supporting_evidence_snippet, exhibit_reference,
+                json.dumps(impact_types), impact_details, supporting_evidence_snippet, exhibit_reference,
                 log_id
             )
         )
-        conn.commit()
-        conn.close()
-        if cursor.rowcount == 0:
-             return jsonify({"message": "Log record found but no changes applied (data was identical)"}), 200
-        return jsonify({"message": f"Log record {log_id} updated successfully"}), 200
-    except sqlite3.Error as e:
-        print(f"Database error during log record update: {e}")
-        return jsonify({"error": "Could not update log record", "details": str(e)}), 500
-    except Exception as e:
-        print(f"An unexpected error occurred during log record update: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
 
-@app.route('/api/log_records/<int:log_id>', methods=['DELETE'])
-def delete_log_record(log_id):
-    """API endpoint to delete a log record and its associated attachments."""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Handle new file uploads for this updated record
+        for file in new_files:
+            if file.filename == '':
+                continue
 
-        # Start a transaction for atomicity
-        conn.execute('BEGIN TRANSACTION;')
+            if not allowed_file(file.filename):
+                raise ValueError(f"File type not allowed for new attachment: {file.filename}")
 
-        # 1. Get associated attachments to delete from disk
-        attachments_to_delete = conn.execute("SELECT filepath, stored_filename FROM attachments WHERE log_record_id = ?", (log_id,)).fetchall()
+            original_filename = file.filename
+            secured_filename = secure_filename(original_filename)
+            file_extension = secured_filename.rsplit('.', 1)[1].lower()
+            unique_filename = f"{uuid.uuid4()}.{file_extension}"
 
-        # 2. Delete attachment records from the database
-        cursor.execute("DELETE FROM attachments WHERE log_record_id = ?", (log_id,))
+            today_path = datetime.now().strftime("%Y/%m")
+            destination_dir = os.path.join(UPLOAD_FOLDER, today_path)
+            if not os.path.exists(destination_dir):
+                os.makedirs(destination_dir)
 
-        # 3. Delete the log record itself
-        cursor.execute("DELETE FROM log_records WHERE id = ?", (log_id,))
+            full_filepath_on_disk = os.path.join(destination_dir, unique_filename)
+            
+            file.save(full_filepath_on_disk)
+            temp_saved_files.append(full_filepath_on_disk)
 
-        if cursor.rowcount == 0:
-            conn.execute('ROLLBACK;')
-            conn.close()
-            return jsonify({"error": "Log record not found"}), 404
+            filesize_bytes = os.path.getsize(full_filepath_on_disk)
 
-        conn.commit()
-
-        # 4. Delete physical files from disk (after DB transaction is complete)
-        for att in attachments_to_delete:
-            full_filepath = os.path.join(UPLOAD_FOLDER, att['filepath'])
-            if os.path.exists(full_filepath):
-                try:
-                    os.remove(full_filepath)
-                    # Attempt to remove the parent directory if it becomes empty
-                    # This helps keep the uploads folder clean (e.g., remove '2025/07' if empty)
-                    parent_dir = os.path.dirname(full_filepath)
-                    if not os.listdir(parent_dir): # Check if directory is empty
-                        os.rmdir(parent_dir)
-                        print(f"Removed empty directory: {parent_dir}")
-                        # Also check the year directory if that became empty
-                        year_dir = os.path.dirname(parent_dir)
-                        if year_dir != UPLOAD_FOLDER and not os.listdir(year_dir):
-                            os.rmdir(year_dir)
-                            print(f"Removed empty year directory: {year_dir}")
-                except OSError as e:
-                    print(f"Error deleting file or directory {full_filepath}: {e}")
-
-
-        conn.close()
-        return jsonify({"message": f"Log record {log_id} and its attachments deleted successfully"}), 200
-
-    except sqlite3.Error as e:
-        conn.execute('ROLLBACK;')
-        print(f"Database error during log record deletion: {e}")
-        return jsonify({"error": "Could not delete log record", "details": str(e)}), 500
-    except Exception as e:
-        print(f"An unexpected error occurred during log record deletion: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
-
-
-@app.route('/api/attachments', methods=['POST'])
-def upload_attachment():
-    """
-    API endpoint to handle file uploads.
-    Expects FormData with 'file' and 'log_record_id'.
-    """
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part in the request"}), 400
-    if 'log_record_id' not in request.form:
-        return jsonify({"error": "No log_record_id provided"}), 400
-
-    file = request.files['file']
-    log_record_id_str = request.form['log_record_id']
-
-    try:
-        log_record_id = int(log_record_id_str)
-    except ValueError:
-        return jsonify({"error": "Invalid log_record_id, must be an integer"}), 400
-
-    conn_check = get_db_connection()
-    record_exists = conn_check.execute("SELECT 1 FROM log_records WHERE id = ?", (log_record_id,)).fetchone()
-    conn_check.close()
-    if not record_exists:
-        return jsonify({"error": f"Log record with ID {log_record_id} does not exist"}), 404
-
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-
-    if file and allowed_file(file.filename):
-        original_filename = file.filename
-        secured_filename = secure_filename(original_filename)
-
-        file_extension = secured_filename.rsplit('.', 1)[1].lower()
-        unique_filename = f"{uuid.uuid4()}.{file_extension}"
-
-        today_path = datetime.now().strftime("%Y/%m")
-        destination_dir = os.path.join(UPLOAD_FOLDER, today_path)
-        if not os.path.exists(destination_dir):
-            os.makedirs(destination_dir)
-
-        full_filepath = os.path.join(destination_dir, unique_filename)
-
-        try:
-            file.save(full_filepath)
-            filesize_bytes = os.path.getsize(full_filepath)
-
-            conn = get_db_connection()
-            cursor = conn.cursor()
             cursor.execute(
                 """
                 INSERT INTO attachments (
@@ -410,145 +518,182 @@ def upload_attachment():
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    log_record_id, original_filename, unique_filename,
+                    log_id, original_filename, unique_filename,
                     os.path.join(today_path, unique_filename),
                     file.content_type, filesize_bytes
                 )
             )
-            conn.commit()
-            attachment_id = cursor.lastrowid
-            conn.close()
+        
+        conn.commit()
+        return jsonify({"message": f"Log record {log_id} updated and new attachments added successfully"}), 200
 
-            return jsonify({
-                "message": "Attachment uploaded successfully",
-                "attachment_id": attachment_id,
-                "original_filename": original_filename,
-                "stored_filename": unique_filename,
-                "filepath": os.path.join(today_path, unique_filename),
-                "log_record_id": log_record_id
-            }), 201
+    except (ValueError, sqlite3.Error) as e:
+        if conn: conn.execute('ROLLBACK;')
+        for fpath in temp_saved_files:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        print(f"Error during record update/attachment add: {e}")
+        return jsonify({"error": str(e)}), 400 if isinstance(e, ValueError) else 500
+    except Exception as e:
+        if conn: conn.execute('ROLLBACK;')
+        for fpath in temp_saved_files:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        print(f"An unexpected error occurred during record update/attachment add: {e}")
+        return jsonify({"error": "An unexpected server error occurred during record update", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
 
-        except sqlite3.Error as e:
-            print(f"Database error during attachment upload: {e}")
-            if os.path.exists(full_filepath):
-                os.remove(full_filepath)
-            return jsonify({"error": "Could not save attachment metadata", "details": str(e)}), 500
-        except Exception as e:
-            print(f"An unexpected error occurred during attachment upload: {e}")
-            if os.path.exists(full_filepath):
-                os.remove(full_filepath)
-            return jsonify({"error": "An unexpected error occurred during file upload", "details": str(e)}), 500
-    else:
-        return jsonify({"error": "File type not allowed or no file selected"}), 400
-
-@app.route('/api/attachments/<filename_to_find>', methods=['GET'])
-def download_attachment(filename_to_find):
-    """
-    API endpoint to serve a single attachment file, with correct download name.
-    """
-    conn = get_db_connection()
-    attachment_info = conn.execute(
-        "SELECT filename, stored_filename, filepath FROM attachments WHERE stored_filename = ?",
-        (filename_to_find,)
-    ).fetchone()
-    conn.close()
-
-    if attachment_info:
-        original_filename = attachment_info['filename']
-        stored_filename = attachment_info['stored_filename']
-        relative_dir = os.path.dirname(attachment_info['filepath'])
-        full_directory_to_serve_from = os.path.join(UPLOAD_FOLDER, relative_dir)
-
-        return send_from_directory(
-            full_directory_to_serve_from,
-            stored_filename,
-            as_attachment=True,
-            download_name=original_filename
-        )
-    else:
-        return jsonify({"error": "File not found or not permitted"}), 404
-
-@app.route('/api/attachments/<int:attachment_id>', methods=['DELETE'])
-def delete_attachment(attachment_id):
-    """API endpoint to delete an individual attachment and its physical file."""
+@app.route('/api/log_records/<int:log_id>', methods=['DELETE'])
+@login_required
+def delete_log_record(log_id):
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Start a transaction
         conn.execute('BEGIN TRANSACTION;')
 
-        # 1. Get attachment info to delete physical file and potentially update log_record_id's attachment_count
+        attachments_to_delete = conn.execute("SELECT filepath, stored_filename FROM attachments WHERE log_record_id = ?", (log_id,)).fetchall()
+
+        cursor.execute("DELETE FROM attachments WHERE log_record_id = ?", (log_id,))
+
+        cursor.execute("DELETE FROM log_records WHERE id = ?", (log_id,))
+
+        if cursor.rowcount == 0:
+            conn.execute('ROLLBACK;')
+            return jsonify({"error": "Log record not found"}), 404
+
+        conn.commit()
+
+        for att in attachments_to_delete:
+            full_filepath = os.path.join(UPLOAD_FOLDER, att['filepath'])
+            if os.path.exists(full_filepath):
+                try:
+                    os.remove(full_filepath)
+                    print(f"Deleted file: {full_filepath}")
+                    parent_dir = os.path.dirname(full_filepath)
+                    if os.path.exists(parent_dir) and not os.listdir(parent_dir):
+                        os.rmdir(parent_dir)
+                        print(f"Removed empty directory: {parent_dir}")
+                        year_dir = os.path.dirname(parent_dir)
+                        if os.path.exists(year_dir) and year_dir != UPLOAD_FOLDER and not os.listdir(year_dir):
+                            os.rmdir(year_dir)
+                            print(f"Removed empty year directory: {year_dir}")
+                except OSError as e:
+                    print(f"Error deleting file or directory {full_filepath}: {e}")
+
+        return jsonify({"message": f"Log record {log_id} and its attachments deleted successfully"}), 200
+
+    except Exception as e:
+        if conn: conn.execute('ROLLBACK;')
+        print(f"An unexpected error occurred during log record deletion: {e}")
+        return jsonify({"error": "An unexpected server error occurred during record deletion", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
+
+@app.route('/api/attachments/<filename_to_find>', methods=['GET'])
+def download_attachment(filename_to_find):
+    conn = None
+    try:
+        conn = get_db_connection()
+        attachment_info = conn.execute(
+            "SELECT filename, stored_filename, filepath FROM attachments WHERE stored_filename = ?",
+            (filename_to_find,)
+        ).fetchone()
+
+        if attachment_info:
+            original_filename = attachment_info['filename']
+            stored_filename = attachment_info['stored_filename']
+            relative_dir = os.path.dirname(attachment_info['filepath'])
+            full_directory_to_serve_from = os.path.join(UPLOAD_FOLDER, relative_dir)
+
+            return send_from_directory(
+                full_directory_to_serve_from,
+                stored_filename,
+                as_attachment=True,
+                download_name=original_filename
+            )
+        else:
+            return jsonify({"error": "File not found or not permitted"}), 404
+    except Exception as e:
+        print(f"Error serving attachment: {e}")
+        return jsonify({"error": "Could not serve file"}), 500
+    finally:
+        if conn: conn.close()
+
+@app.route('/api/attachments/<int:attachment_id>', methods=['DELETE'])
+@login_required
+def delete_attachment(attachment_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        conn.execute('BEGIN TRANSACTION;')
+
         attachment_info = conn.execute("SELECT log_record_id, filepath, stored_filename FROM attachments WHERE id = ?", (attachment_id,)).fetchone()
         if attachment_info is None:
             conn.execute('ROLLBACK;')
-            conn.close()
             return jsonify({"error": "Attachment not found"}), 404
 
         log_record_id = attachment_info['log_record_id']
         file_to_delete_path = attachment_info['filepath']
         stored_filename_to_delete = attachment_info['stored_filename']
 
-        # 2. Delete attachment record from the database
         cursor.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
-        if cursor.rowcount == 0: # Should not happen if attachment_info was found, but good check
+        if cursor.rowcount == 0:
             conn.execute('ROLLBACK;')
-            conn.close()
             return jsonify({"error": "Attachment not found during deletion attempt"}), 404
 
-        conn.commit() # Commit DB changes
+        conn.commit()
 
-        # 3. Delete physical file from disk (after DB transaction is complete)
         full_filepath = os.path.join(UPLOAD_FOLDER, file_to_delete_path)
         if os.path.exists(full_filepath):
             try:
                 os.remove(full_filepath)
                 print(f"Deleted physical attachment file: {full_filepath}")
-                # Attempt to remove empty parent directories (month/year)
                 parent_dir = os.path.dirname(full_filepath)
-                if not os.listdir(parent_dir): # Check if month directory is empty
+                if os.path.exists(parent_dir) and not os.listdir(parent_dir):
                     os.rmdir(parent_dir)
                     print(f"Removed empty directory: {parent_dir}")
                     year_dir = os.path.dirname(parent_dir)
-                    if year_dir != UPLOAD_FOLDER and not os.listdir(year_dir): # Check if year directory is empty
+                    if os.path.exists(year_dir) and year_dir != UPLOAD_FOLDER and not os.listdir(year_dir):
                         os.rmdir(year_dir)
                         print(f"Removed empty year directory: {year_dir}")
             except OSError as e:
-                print(f"Error deleting physical file or directory {full_filepath}: {e}")
-                # Log error but don't return 500, as DB is consistent
+                print(f"Error deleting file or directory {full_filepath}: {e}")
 
-        conn.close()
         return jsonify({"message": f"Attachment {stored_filename_to_delete} deleted successfully"}), 200
 
-    except sqlite3.Error as e:
-        conn.execute('ROLLBACK;')
-        print(f"Database error during attachment deletion: {e}")
-        return jsonify({"error": "Could not delete attachment", "details": str(e)}), 500
     except Exception as e:
+        if conn: conn.execute('ROLLBACK;')
         print(f"An unexpected error occurred during attachment deletion: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        return jsonify({"error": "An unexpected server error occurred during attachment deletion", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
 
 
 @app.route('/api/log_records/<int:log_record_id>/attachments', methods=['GET'])
+@login_required
 def get_log_record_attachments(log_record_id):
-    """API endpoint to retrieve attachments for a specific log record."""
+    conn = None
     try:
         conn = get_db_connection()
         attachments = conn.execute("SELECT * FROM attachments WHERE log_record_id = ?", (log_record_id,)).fetchall()
-        conn.close()
 
         attachments_list = [dict(att) for att in attachments]
         return jsonify(attachments_list), 200
-    except sqlite3.Error as e:
-        print(f"Database error fetching attachments: {e}")
-        return jsonify({"error": "Could not retrieve attachments", "details": str(e)}), 500
     except Exception as e:
         print(f"An unexpected error occurred fetching attachments: {e}")
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        return jsonify({"error": "An unexpected server error occurred fetching attachments", "details": str(e)}), 500
+    finally:
+        if conn: conn.close()
 
 @app.route('/api/config/allowed_extensions', methods=['GET'])
+@login_required
 def get_allowed_extensions():
-    """API endpoint to retrieve the list of allowed file extensions for uploads."""
     return jsonify(list(ALLOWED_EXTENSIONS)), 200
 
 if __name__ == '__main__':

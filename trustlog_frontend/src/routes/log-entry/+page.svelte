@@ -3,10 +3,12 @@
     import { slide } from 'svelte/transition';
     import { goto } from '$app/navigation';
     import { onMount } from 'svelte';
-    import { page } from '$app/stores'; // Import SvelteKit's page store to get URL params
+    import { page } from '$app/stores';
+    import { browser } from '$app/environment';
+    import { authenticatedFetch } from '$lib/utils/api';
 
     // Form fields, initialized to empty or default values
-    let logRecordId: number | null = null; // Will store the ID if in edit mode
+    let logRecordId: number | null = null;
     let dateOfIncident: string = '';
     let category: string = '';
     let descriptionOfIncident: string = '';
@@ -18,7 +20,7 @@
     // Attachment related variables
     let selectedFiles: FileList | null = null;
     let fileUploadProgress: { file: File; progress: number; status: 'pending' | 'uploading' | 'complete' | 'failed' }[] = [];
-    let uploadedAttachments: { id: number; filename: string; filepath: string; stored_filename: string; }[] = []; // Added stored_filename
+    let uploadedAttachments: { id: number; filename: string; filepath: string; stored_filename: string; }[] = [];
     let allowedExtensions: string[] = [];
 
     // State for fetching/loading existing record
@@ -48,26 +50,30 @@
 
     $: showSupportingEvidence = category === 'Unilateral Decision-Making';
 
-    const FLASK_API_BASE_URL = 'http://localhost:5000';
+    const FLASK_API_BASE_URL = 'http://localhost:5000'; // Still used for download links directly
 
     onMount(async () => {
-        await fetchAllowedExtensions();
+        if (browser) { // Only run this block in the browser
+            await fetchAllowedExtensions();
 
-        // Check if in edit mode
-        const idParam = $page.url.searchParams.get('id');
-        if (idParam) {
-            logRecordId = parseInt(idParam, 10);
-            isEditMode = true;
-            await fetchLogRecordForEdit(logRecordId);
+            const idParam = $page.url.searchParams.get('id');
+            if (idParam) {
+                logRecordId = parseInt(idParam, 10);
+                isEditMode = true;
+                await fetchLogRecordForEdit(logRecordId);
+            } else {
+                isEditMode = false;
+                fetchingRecord = false; // No record to fetch for new entry
+            }
         } else {
-            isEditMode = false;
-            fetchingRecord = false; // No record to fetch for new entry
+            // During SSR, set fetchingRecord to false to avoid hanging loaders
+            fetchingRecord = false;
         }
     });
 
     async function fetchAllowedExtensions() {
         try {
-            const response = await fetch(`${FLASK_API_BASE_URL}/api/config/allowed_extensions`);
+            const response = await authenticatedFetch('/api/config/allowed_extensions');
             if (response.ok) {
                 allowedExtensions = await response.json();
             } else {
@@ -75,8 +81,12 @@
                 allowedExtensions = ['Error fetching types'];
             }
         } catch (e) {
-            console.error('Network error fetching allowed extensions:', e);
-            allowedExtensions = ['Network Error'];
+            if (e.message !== 'Unauthorized') {
+                console.error('Network error fetching allowed extensions:', e);
+                allowedExtensions = ['Network Error'];
+            } else {
+                allowedExtensions = ['Login to see types'];
+            }
         }
     }
 
@@ -84,7 +94,7 @@
         fetchingRecord = true;
         recordError = null;
         try {
-            const response = await fetch(`${FLASK_API_BASE_URL}/api/log_records/${id}`);
+            const response = await authenticatedFetch(`/api/log_records/${id}`);
             if (response.ok) {
                 const record = await response.json();
                 dateOfIncident = record.date_of_incident;
@@ -95,13 +105,11 @@
                 supportingEvidenceSnippet = record.supporting_evidence_snippet;
                 exhibitReference = record.exhibit_reference;
 
-                // Fetch existing attachments for this log record
-                const attachmentsResponse = await fetch(`${FLASK_API_BASE_URL}/api/log_records/${id}/attachments`);
+                const attachmentsResponse = await authenticatedFetch(`/api/log_records/${id}/attachments`);
                 if (attachmentsResponse.ok) {
                     uploadedAttachments = await attachmentsResponse.json();
                 } else {
                     console.error('Failed to fetch existing attachments:', await attachmentsResponse.json());
-                    // Don't block if attachments fail, just show error
                 }
             } else {
                 const errorData = await response.json();
@@ -109,13 +117,16 @@
                 console.error('Error fetching record for edit:', errorData);
             }
         } catch (e: any) {
-            recordError = `Network error loading record: ${e.message}`;
+            if (e.message !== 'Unauthorized') {
+                recordError = `Network error loading record: ${e.message}`;
+            } else {
+                recordError = 'Please log in to edit records.';
+            }
             console.error('Network or unexpected error loading record:', e);
         } finally {
             fetchingRecord = false;
         }
     }
-
 
     async function saveLogRecord() {
         if (!dateOfIncident || !category || !descriptionOfIncident || impactTypes.length === 0) {
@@ -123,54 +134,57 @@
             return;
         }
 
-        const logData = {
-            date_of_incident: dateOfIncident,
-            category: category,
-            description_of_incident: descriptionOfIncident,
-            impact_types: impactTypes,
-            impact_details: impactDetails,
-            supporting_evidence_snippet: showSupportingEvidence ? supportingEvidenceSnippet : null,
-            exhibit_reference: exhibitReference
-        };
+        // --- Prepare FormData for combined text and files ---
+        const formData = new FormData();
+        formData.append('date_of_incident', dateOfIncident);
+        formData.append('category', category);
+        formData.append('description_of_incident', descriptionOfIncident);
+        // Stringify impact_types array as backend expects a JSON string
+        formData.append('impact_types', JSON.stringify(impactTypes));
+        formData.append('impact_details', impactDetails || '');
+        formData.append('supporting_evidence_snippet', showSupportingEvidence ? (supportingEvidenceSnippet || '') : 'null');
+        formData.append('exhibit_reference', exhibitReference || '');
 
-        console.log('Sending Log Data:', logData);
+        // Append selected files (for new attachments or in edit mode)
+        if (selectedFiles) {
+            for (let i = 0; i < selectedFiles.length; i++) {
+                formData.append('files', selectedFiles[i]); // Key is 'files' (plural) for backend to getlist
+            }
+        }
+        // --- End FormData preparation ---
 
         let method = 'POST';
-        let url = `${FLASK_API_BASE_URL}/api/log_records`;
+        let url = `/api/log_records`;
         if (isEditMode && logRecordId) {
             method = 'PUT';
-            url = `${FLASK_API_BASE_URL}/api/log_records/${logRecordId}`;
+            url = `/api/log_records/${logRecordId}`;
         }
 
         try {
-            const response = await fetch(url, {
+            // Send FormData. Do NOT set 'Content-Type' header; browser handles it for FormData.
+            const response = await authenticatedFetch(url, {
                 method: method,
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(logData)
+                body: formData
             });
 
             if (response.ok) {
                 const result = await response.json();
                 console.log('Log record saved/updated successfully:', result);
                 alert(`Log Record ${isEditMode ? 'Updated' : 'Saved'} Successfully!`);
-
-                const currentLogId = isEditMode ? logRecordId : result.id;
-                if (selectedFiles && selectedFiles.length > 0 && currentLogId) {
-                    await uploadAttachments(currentLogId);
-                }
-
-                clearForm();
-                goto('/reports');
+                clearForm(); // Clear form on success
+                goto('/reports'); // Redirect to reports
             } else {
                 const errorData = await response.json();
                 console.error(`Error ${isEditMode ? 'updating' : 'creating'} log record:`, errorData);
+                // Since backend is atomic, this error means nothing was saved/updated.
                 alert(`Failed to ${isEditMode ? 'update' : 'save'} log record: ${errorData.error || response.statusText}`);
             }
         } catch (error) {
-            console.error('Network or unexpected error:', error);
-            alert('An unexpected error occurred while trying to save the log record.');
+            if (error.message !== 'Unauthorized') {
+                console.error('Network or unexpected error:', error);
+                alert('An unexpected error occurred while trying to save the log record.');
+            }
+            // No alert needed if it was an "Unauthorized" error as authenticatedFetch handles redirection.
         }
     }
 
@@ -201,71 +215,28 @@
         }
     }
 
-    async function uploadAttachments(logId: number) {
-        if (!selectedFiles || selectedFiles.length === 0) return;
+    // `uploadAttachments` function is removed as its logic is now within `saveLogRecord`
 
-        console.log(`Uploading ${selectedFiles.length} attachments for log ID: ${logId}`);
-
-        for (let i = 0; i < selectedFiles.length; i++) {
-            const file = selectedFiles[i];
-            fileUploadProgress[i].status = 'uploading';
-
-            const formData = new FormData();
-            formData.append('file', file);
-            formData.append('log_record_id', logId.toString());
-
-            try {
-                fileUploadProgress[i].progress = 50;
-                const response = await fetch(`${FLASK_API_BASE_URL}/api/attachments`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (response.ok) {
-                    const result = await response.json();
-                    console.log(`Attachment '${file.name}' uploaded:`, result);
-                    fileUploadProgress[i].progress = 100;
-                    fileUploadProgress[i].status = 'complete';
-                    uploadedAttachments = [...uploadedAttachments, {
-                        id: result.attachment_id,
-                        filename: result.original_filename,
-                        filepath: result.filepath,
-                        stored_filename: result.stored_filename // Keep stored_filename for potential deletion later
-                    }];
-                } else {
-                    const errorData = await response.json();
-                    console.error(`Error uploading attachment '${file.name}':`, errorData);
-                    fileUploadProgress[i].status = 'failed';
-                    alert(`Failed to upload attachment '${file.name}': ${errorData.error || response.statusText}`);
-                }
-            } catch (error) {
-                console.error(`Network or unexpected error during upload of '${file.name}':`, error);
-                fileUploadProgress[i].status = 'failed';
-                alert(`An unexpected error occurred while uploading '${file.name}'.`);
-            }
-        }
-    }
-
-    // NEW: Function to delete an individual attachment (useful in edit mode)
     async function deleteAttachment(attachmentId: number, filename: string) {
         if (!confirm(`Are you sure you want to delete the attachment "${filename}"?`)) {
             return;
         }
         try {
-            const response = await fetch(`${FLASK_API_BASE_URL}/api/attachments/${attachmentId}`, {
+            const response = await authenticatedFetch(`/api/attachments/${attachmentId}`, {
                 method: 'DELETE',
             });
             if (response.ok) {
                 alert(`Attachment "${filename}" deleted successfully.`);
-                // Remove from local list
                 uploadedAttachments = uploadedAttachments.filter(att => att.id !== attachmentId);
             } else {
                 const errorData = await response.json();
                 alert(`Failed to delete attachment: ${errorData.error || response.statusText}`);
             }
         } catch (error) {
-            console.error('Error deleting attachment:', error);
-            alert('An unexpected error occurred while deleting the attachment.');
+            if (error.message !== 'Unauthorized') {
+                console.error('Error deleting attachment:', error);
+                alert('An unexpected error occurred while deleting the attachment.');
+            }
         }
     }
 
@@ -440,6 +411,7 @@
                     </div>
                 {/if}
             </div>
+
             <div class="button-group">
                 <button type="submit" class="save-button">{isEditMode ? 'Update Log Record' : 'Save Log Record'}</button>
                 <button type="button" on:click={clearForm} class="clear-button">
@@ -503,12 +475,11 @@
         width: 100%;
         padding: 0.8rem;
         border: 1px solid #ccc;
-        border-radius: 44px; /* Fix: was 44px, should be 4px like others for consistency */
+        border-radius: 4px;
         box-sizing: border-box;
         font-size: 1rem;
     }
 
-    /* Corrected: ensure textareas have 4px border-radius */
     .log-form textarea {
         border-radius: 4px;
         resize: vertical;
@@ -571,7 +542,7 @@
     }
 
     .clear-button {
-        background-color: #6c757d; /* Changed from red to grey for "Cancel Edit" */
+        background-color: #6c757d;
         color: white;
     }
 
@@ -656,7 +627,6 @@
     .delete-attachment-button:hover {
         background-color: #c82333;
     }
-
 
     .attachment-input {
         padding: 0.5rem 0;
