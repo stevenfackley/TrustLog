@@ -24,20 +24,19 @@ export async function authenticatedFetch(endpoint: string, options?: RequestInit
         const response = await fetch(url, defaultOptions);
 
         if (response.status === 401) {
-            // If unauthorized, clear local auth state and redirect to login
-            console.warn('Authentication expired or unauthorized access. Redirecting to login.');
-            authStore.logout(); // Clear the client-side state
-            if (browser) { // Ensure goto is called only in the browser
+            console.warn('Authentication expired or unauthorized access. Attempting to clear session and redirect to login.');
+            // This is the core fix: Immediately clear localStorage and authStore state
+            // and then perform the redirect.
+            authStore.forceLogout(); // Call the new forceLogout to ensure localStorage is cleared directly.
+            if (browser) {
                 await goto('/login');
             }
-            // Throw an error to stop further processing in the calling function
-            throw new Error('Unauthorized');
+            throw new Error('Unauthorized'); // Stop further processing
         }
 
         return response;
     } catch (error) {
         console.error(`Network error or problem with fetch to ${url}:`, error);
-        // Re-throw the error so calling components can handle it (e.g., display a message)
-        throw error;
+        throw error; // Re-throw the error for component-specific handling
     }
 }

@@ -2,11 +2,12 @@
     import { authStore } from '$lib/stores/authStore';
     import { goto } from '$app/navigation';
     import { page } from '$app/stores';
-    import { browser } from '$app/environment'; // Import browser environment variable
+    import { browser } from '$app/environment';
+    import { onMount } from 'svelte'; // Import onMount
 
     // Function to handle logout
     async function handleLogout() {
-        const FLASK_API_BASE_URL = 'http://localhost:5000'; // Keep for this specific direct logout call
+        const FLASK_API_BASE_URL = 'http://localhost:5000';
 
         try {
             const response = await fetch(`${FLASK_API_BASE_URL}/api/logout`, {
@@ -17,8 +18,8 @@
             if (response.ok) {
                 console.log('Logged out successfully.');
                 authStore.logout(); // Clear Svelte store state
-                if (browser) { // Ensure goto is only called in the browser
-                    await goto('/login'); // Use await to ensure redirection happens before other actions
+                if (browser) {
+                    await goto('/login');
                 }
             } else {
                 const errorData = await response.json();
@@ -31,9 +32,46 @@
         }
     }
 
+    // NEW: Function to check backend authentication status
+    async function checkAuthStatus() {
+        if (!browser) return; // Only run in browser
+
+        const FLASK_API_BASE_URL = 'http://localhost:5000'; // Define backend URL for this specific status check
+
+        try {
+            // Make an unprotected call to /api/status to get backend's view of auth
+            const response = await fetch(`${FLASK_API_BASE_URL}/api/status`, {
+                credentials: 'include' // Still include credentials to get accurate status
+            });
+            const statusData = await response.json();
+
+            if (statusData.authenticated && !$authStore.isAuthenticated) {
+                // Backend says authenticated, but frontend doesn't. Sync frontend.
+                authStore.login(statusData.username);
+                console.log('Frontend auth state synced from backend (logged in).');
+            } else if (!statusData.authenticated && $authStore.isAuthenticated) {
+                // Backend says NOT authenticated, but frontend thinks it is. Force logout.
+                console.warn('Backend indicates unauthenticated, but frontend state is authenticated. Forcing logout.');
+                authStore.forceLogout(); // Use forceLogout to clear localStorage
+                // We don't need a goto here, as the reactive statement below will handle the redirect
+            } else {
+                // States match or user is not on protected page yet
+                console.log('Auth states are in sync or not yet relevant for redirect.');
+            }
+        } catch (error) {
+            console.error('Failed to check backend auth status:', error);
+            // If API is down or network error, assume not logged in, but don't clear client state prematurely
+            // unless a specific 401 from protected route handling in authenticatedFetch triggers it.
+        }
+    }
+
+    onMount(() => {
+        // Run this check when the layout component mounts
+        checkAuthStatus();
+    });
+
     // Reactive statement for redirection logic
     $: {
-        // This entire block runs reactivity, so ensure browser-specific APIs are guarded
         if (browser) {
             if (!$authStore.isAuthenticated && $page.url.pathname !== '/login' && $page.url.pathname !== '/register') {
                 goto('/login');

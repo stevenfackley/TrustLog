@@ -1,4 +1,4 @@
-// src/lib/stores/authStore.ts
+// src/lib/stores/authStore.ts (Updated with forceLogout)
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 
@@ -28,7 +28,16 @@ export const authStore = {
     login: (username: string) => {
         auth.update(state => ({ isAuthenticated: true, username }));
     },
-    logout: () => {
+    logout: () => { // This is for explicit logout initiated by user
         auth.update(state => ({ isAuthenticated: false, username: null }));
+    },
+    // NEW: forceLogout for handling unauthorized API responses
+    forceLogout: () => {
+        if (browser) {
+            localStorage.removeItem('isAuthenticated');
+            localStorage.removeItem('username');
+            // Explicitly set the store state
+            auth.set({ isAuthenticated: false, username: null });
+        }
     }
 };

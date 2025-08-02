@@ -79,7 +79,7 @@
         'Alcohol Use'
     ];
 
-    const FLASK_API_BASE_URL = 'http://localhost:5000'; // Still used for download links directly
+    const FLASK_API_BASE_URL = 'http://localhost:5000';
 
     let chartCanvas: HTMLCanvasElement;
     let myChart: Chart | null = null;
@@ -133,9 +133,7 @@
                             text: 'Count'
                         },
                         ticks: {
-                            callback: function(value: number) {
-                                if (value % 1 === 0) { return value; }
-                            }
+                            precision: 0 // Ensures only whole numbers are used as ticks
                         }
                     },
                     x: {
@@ -190,7 +188,7 @@
         params.append('sort_order', sortOrder);
 
         const queryString = params.toString();
-        const url = `/api/log_records${queryString ? `?${queryString}` : ''}`;
+        const url = `/api/log_records/${queryString ? `?${queryString}` : ''}`;
 
         try {
             const response = await authenticatedFetch(url);
@@ -733,40 +731,6 @@
         border-bottom: 1px dashed #eee;
     }
 
-    .simple-bar-chart {
-        /* These styles are unused and will be removed */
-        list-style: none;
-        padding: 0;
-        margin: 1.5rem 0;
-    }
-
-    .simple-bar-chart li {
-        /* These styles are unused and will be removed */
-        background-color: #a0cffc;
-        color: #333;
-        padding: 0.5rem;
-        margin-bottom: 0.5rem;
-        border-radius: 4px;
-        position: relative;
-        overflow: hidden;
-        white-space: nowrap;
-        box-sizing: border-box;
-        width: var(--bar-width, 10%);
-        min-width: 50px;
-        transition: width 0.5s ease-out;
-    }
-
-    .chart-placeholder {
-        /* These styles are unused and will be removed */
-        background-color: #f0f8ff;
-        border: 1px dashed #cceeff;
-        padding: 1.5rem;
-        border-radius: 8px;
-        text-align: center;
-        margin-top: 1.5rem;
-    }
-
-    /* Styles for chart container */
     .chart-container {
         position: relative;
         height: 400px;
@@ -776,11 +740,6 @@
         padding: 1rem;
         border-radius: 8px;
         box-shadow: inset 0 0 5px rgba(0,0,0,0.05);
-    }
-
-    .charts-view .chart-placeholder {
-        /* This rule hides the old placeholder div */
-        display: none;
     }
 
     .charts-view p {
